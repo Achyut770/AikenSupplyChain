@@ -1,10 +1,11 @@
 use aiken/builtin
-use aiken/dict.{Dict, get, new}
-use aiken/hash.{Blake2b_224, Blake2b_256, Hash}
+use aiken/bytearray
+use aiken/dict.{Dict}
+use aiken/hash.{Blake2b_224, Blake2b_256, Hash, blake2b_256}
 use aiken/list
 use aiken/transaction.{
   DatumHash, InlineDatum, Input, Output, OutputReference, ScriptContext, Spend,
-  Transaction, TransactionId, find_input,
+  Transaction, TransactionId, find_datum, find_input,
 }
 use aiken/transaction/credential.{Address, ScriptCredential, VerificationKey}
 use aiken/transaction/value.{
@@ -107,12 +108,12 @@ fn must_be_signed_by(transaction: Transaction, vk: VerificationKeyHash) {
   list.has(transaction.extra_signatories, vk)
 }
 
-fn find_datum(datum: transaction.Datum, ctx: ScriptContext) {
+fn find_datums(datum: transaction.Datum, ctx: ScriptContext) {
   let ScriptContext { transaction, .. } = ctx
-  let Transaction { datums, .. } = transaction
+  let Transaction { outputs, datums, .. } = transaction
   when datum is {
     DatumHash(key) -> {
-      expect Some(value) = get(datums, key)
+      expect Some(value) = find_datum(outputs, datums, key)
       expect exact_datum: Datum = value
       exact_datum
     }
@@ -126,7 +127,7 @@ fn find_datum(datum: transaction.Datum, ctx: ScriptContext) {
 
 fn check_datum_for_comment(dtm: Datum, ctx: ScriptContext) {
   let output = get_continuing_txn(ctx)
-  let datum = find_datum(output.datum, ctx)
+  let datum = find_datums(output.datum, ctx)
   when datum.comments is {
     [] -> False
     _ -> {
@@ -141,7 +142,7 @@ fn check_datum_for_comment(dtm: Datum, ctx: ScriptContext) {
 
 fn check_datum_for_transfer(dtm: Datum, ctx: ScriptContext) {
   let output = get_continuing_txn(ctx)
-  let datum = find_datum(output.datum, ctx)
+  let datum = find_datums(output.datum, ctx)
   let owners_length = list.length(datum.owners)
   let owners_removed_last = list.take(datum.owners, owners_length - 1)
   expect Some(last_owner) = list.last(datum.owners)
@@ -367,6 +368,19 @@ test supplychain_test_transfer_correct_datum() {
   )
 }
 
+test supplychain_test_transfer_no_signature_from_currentowner() {
+  let input_datum = Datum { ..initialdatum(), currentowner: second_user() }
+  !supplychain_test(
+    Transfer,
+    input_datum,
+    correct_datum_transfer(),
+    asset(),
+    asset(),
+    policy_id(),
+    asset_name(),
+  )
+}
+
 test supplychain_test_transfer_incorrect_datum_manufacture_date() {
   let output_datum =
     Datum { ..correct_datum_transfer(), manufactuerdate: 9878675645 }
@@ -534,71 +548,91 @@ fn supplychain_test(
     }
   supplychain(policy_id, asset_name, input_datum, redemer, context)
 }
+
 // ------------ Testing with datumHash --------------
 
-// test supply_chain_transfer_correct() {
-//   let datum_hash = #"00000000000000000000000000000000000000000000000000000005"
-//   let data = builtin.serialise_data(correct_datum_transfer())
-//   let result =
-//     dict.new()
-//       |> dict.insert(key: datum_hash, value: data, compare: fn(x, y) { Greater })
-//   supplychain_test_datum_hash(
-//     Transfer,
-//     initialdatum(),
-//     datum_hash,
-//     asset(),
-//     asset(),
-//     policy_id(),
-//     asset_name(),
-//     result,
-//   )
-// }
+test supply_chain_transfer_correct_datum_hash() {
+  let datum: Data = correct_datum_transfer()
+  let datum_hash = blake2b_256(builtin.serialise_data(datum))
 
-// fn supplychain_test_datum_hash(
-//   redemer: Action,
-//   input_datum: Datum,
-//   output_datum: Hash<Blake2b_256, Data>,
-//   input_asset: Value,
-//   output_asset: Value,
-//   policy_id: PolicyId,
-//   asset_name: AssetName,
-//   datums: Dict<Hash<Blake2b_256, Data>, Data>,
-// ) {
-//   let placeholder_utxo =
-//     OutputReference { transaction_id: TransactionId(""), output_index: 0 }
+  let datums =
+    dict.new()
+      |> dict.insert(key: datum_hash, value: datum, compare: bytearray.compare)
+  supplychain_test_datum_hash(
+    Transfer,
+    initialdatum(),
+    datum_hash,
+    asset(),
+    asset(),
+    policy_id(),
+    asset_name(),
+    datums,
+  )
+}
 
-//   let input =
-//     Input {
-//       output_reference: placeholder_utxo,
-//       output: Output {
-//         address: contract_address(),
-//         value: input_asset,
-//         datum: InlineDatum(input_datum),
-//         reference_script: None,
-//       },
-//     }
-//   let output =
-//     Output {
-//       address: contract_address(),
-//       value: output_asset,
-//       datum: DatumHash(output_datum),
-//       reference_script: None,
-//     }
+test supply_chain_comment_correct_datum_hash() {
+  let datum: Data = correct_datum_comment()
+  let datum_hash = blake2b_256(builtin.serialise_data(datum))
+  let datums =
+    dict.new()
+      |> dict.insert(key: datum_hash, value: datum, compare: bytearray.compare)
+  supplychain_test_datum_hash(
+    Comment,
+    initialdatum(),
+    datum_hash,
+    asset(),
+    asset(),
+    policy_id(),
+    asset_name(),
+    datums,
+  )
+}
 
-//   let context =
-//     ScriptContext {
-//       purpose: Spend(placeholder_utxo),
-//       transaction: transaction.placeholder()
-//         |> fn(transaction) {
-//              Transaction {
-//                ..transaction,
-//                extra_signatories: [first_user()],
-//                inputs: [input],
-//                outputs: [output],
-//                datums: datums,
-//              }
-//            },
-//     }
+fn supplychain_test_datum_hash(
+  redemer: Action,
+  input_datum: Datum,
+  output_datum: Hash<Blake2b_256, Data>,
+  input_asset: Value,
+  output_asset: Value,
+  policy_id: PolicyId,
+  asset_name: AssetName,
+  datums: Dict<Hash<Blake2b_256, Data>, Data>,
+) {
+  let placeholder_utxo =
+    OutputReference { transaction_id: TransactionId(""), output_index: 0 }
 
-//   supplychain(policy_id, asset_name, input_datum, redemer, context)
-// }
+  let input =
+    Input {
+      output_reference: placeholder_utxo,
+      output: Output {
+        address: contract_address(),
+        value: input_asset,
+        datum: InlineDatum(input_datum),
+        reference_script: None,
+      },
+    }
+  let output =
+    Output {
+      address: contract_address(),
+      value: output_asset,
+      datum: DatumHash(output_datum),
+      reference_script: None,
+    }
+
+  let context =
+    ScriptContext {
+      purpose: Spend(placeholder_utxo),
+      transaction: transaction.placeholder()
+        |> fn(transaction) {
+             Transaction {
+               ..transaction,
+               extra_signatories: [first_user()],
+               inputs: [input],
+               outputs: [output],
+               datums: datums,
+             }
+           },
+    }
+
+  supplychain(policy_id, asset_name, input_datum, redemer, context)
+}
